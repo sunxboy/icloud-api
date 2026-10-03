@@ -8,6 +8,10 @@
 /coverage.out
 /.idea/
 /.vscode/
+/.agents/
+/.claude/
+/skills-lock.json
+/SKILLS_INSTALLATION.md
 /.env
 /.env.*
 !/.env.example
