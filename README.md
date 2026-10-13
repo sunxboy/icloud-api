@@ -2,7 +2,7 @@
 
 本服务把 iCloud 隐私邮箱的新邮件归档到本地，并且只向外提供两种取件能力：
 
-1. `GET /api/v1/otp`：按邮箱返回持续累积的验证码历史。
+1. `GET /api/v1/otp`：按邮箱返回持续累积的验证码历史；也可用 `format` 参数只取最新验证码本身，或原样查看该邮件的 HTML 正文。
 2. 标准只读 IMAPS：按邮箱读取完整 MIME；正文已淘汰或不可用时返回保留原标题的占位邮件。
 
 `POST /oauth2/v2.0/token` 只为 IMAPS 的 XOAUTH2 登录签发一小时访问令牌，不构成第三种取件方式。服务签发的 API Key、IMAP 密码、client ID、refresh token 和 access token 都是本服务凭据，不是 Microsoft 凭据。
@@ -188,7 +188,23 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN'
 {"otp":"876543","time":"2026-08-11T12:00:00+08:00"}
 ```
 
-旧变量 `ICLOUD_API_OTP_RETURN_LAST_ONLY` 继续作为兼容别名，开启后同样返回最新 OTP；同时配置两个变量时，以 `ICLOUD_API_OTP_RETURN_LATEST_ONLY` 为准。两种模式在没有验证码时都返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，支持未与字母或数字相邻的连续 6 位 ASCII 数字，以及 Grok 使用的 `610-313` 这种三位数字加连字符再加三位数字的格式，返回时保留连字符；不会从更长的连字符分组号码中截取片段。每封邮件最多保存一个候选，升级前保存的不符合这两种格式的历史值也会在读取时忽略。
+除上述默认 JSON 契约外，还可以用 `format` 参数改变输出形态。查询串只接受 `token` 与 `format`，多余参数、重复参数或无法解析的查询串一律按凭证无效拒绝：
+
+```bash
+# 只输出最新验证码本身（以单个换行结尾）
+curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN&format=plain'
+
+# 原样输出最新验证码邮件的 HTML 正文
+curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN&format=html'
+```
+
+`format=plain` 的响应体就是验证码本身（例如 `876543`），Content-Type 为 `text/plain`。`format=html` 原样返回该邮件的 HTML 正文，Content-Type 为 `text/html`，既不净化也不重写其中的标签，所以邮件里的图片和按钮都能正常加载与点击。两种形态在**没有验证码时都返回 `200` 与零字节响应体**（`html` 即一张空白页）；有验证码、但该邮件的归档正文已被清理或校验失败时，`html` 返回 `404 MAIL_CONTENT_UNAVAILABLE`，不会静默降级成空白页。
+
+`format=html` 优先渲染发信人提供的 HTML 部件；邮件只有纯文本时，把该文本转义后以等宽块显示，而不是丢一张空白页——纯文本里看起来像标签的内容会原样可见，不会被当作标记。因此只有「没有验证码」或「邮件完全没有可读正文」才会得到零字节响应体。另外正文以 `ICLOUD_API_MAX_BODY_BYTES`（默认 512 KiB）为上限，超出的部分会被截断。管理界面「复制取码格式」生成的链接始终不带 `format`，需要这些形态时请手动拼接参数。
+
+`format=html` 渲染的是不可信的第三方邮件内容，因此该响应单独使用一份 CSP：保留 `script-src 'self'`（邮件内脚本不会执行）和 `base-uri 'self'`（防止邮件塞 `<base>` 劫持正文里的相对链接），只放宽 `img-src` 以允许外链图片，并把 `form-action` 收紧为 `'none'`。注意：放开外链图片意味着发信人可以通过图片 URL 得知你何时打开了取码页；页面中的链接会在当前标签页内跳转，离开后需要重新请求才能再看到验证码。
+
+旧变量 `ICLOUD_API_OTP_RETURN_LAST_ONLY` 继续作为兼容别名，开启后同样返回最新 OTP；同时配置两个变量时，以 `ICLOUD_API_OTP_RETURN_LATEST_ONLY` 为准。这两种 JSON 模式在没有验证码时都返回 `200 []`。重复请求不会消费验证码、不会改变本地状态，也不会给上游邮件设置已读标志。迁移和轮换后 OTP URL 仍使用 `/api/v1/otp`；v2 alias 的 OTP token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名，不能通过改写 URL 路径或信封版本互换。这里的 v3 仅指 OTP token 信封版本，不是新的 alias credential mode。原 v1 直达 token 只继续用于尚未执行全量迁移的 legacy alias 的 `/api/v1/mail/recent`。OTP 从主题、纯文本和 HTML 可读文本中提取，支持未与字母或数字相邻的连续 6 位 ASCII 数字，以及 Grok 使用的 `610-313` 这种三位数字加连字符再加三位数字的格式，返回时保留连字符；不会从更长的连字符分组号码中截取片段。每封邮件最多保存一个候选，升级前保存的不符合这两种格式的历史值也会在读取时忽略。
 
 ## 旧接口兼容
 

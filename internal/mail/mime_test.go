@@ -269,6 +269,56 @@ func TestParseMIMEMessageOnlyAllowsPartialMIMEForTruncatedSource(t *testing.T) {
 	}
 }
 
+func TestBodiesFromMIMEReturnsBothParts(t *testing.T) {
+	raw := strings.Join([]string{
+		`MIME-Version: 1.0`,
+		`Content-Type: multipart/alternative; boundary=x`,
+		``,
+		`--x`,
+		`Content-Type: text/plain; charset=utf-8`,
+		``,
+		`code 783448`,
+		`--x`,
+		`Content-Type: text/html; charset=utf-8`,
+		``,
+		`<p>783448</p>`,
+		`--x--`,
+		``,
+	}, "\r\n")
+
+	got, err := BodiesFromMIME(strings.NewReader(raw), int64(len(raw)), 512<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != "code 783448" || got.HTML != "<p>783448</p>" {
+		t.Fatalf("bodies = text %q html %q", got.Text, got.HTML)
+	}
+}
+
+func TestBodiesFromMIMELeavesHTMLEmptyForPlainTextMessages(t *testing.T) {
+	raw := "Subject: plain\r\nContent-Type: text/plain; charset=utf-8\r\n\r\ncode 783448"
+
+	got, err := BodiesFromMIME(strings.NewReader(raw), int64(len(raw)), 512<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HTML != "" || got.Text != "code 783448" {
+		t.Fatalf("bodies = text %q html %q", got.Text, got.HTML)
+	}
+}
+
+func TestBodiesFromMIMEHonoursExplicitBodyBudget(t *testing.T) {
+	raw := "Content-Type: text/html; charset=utf-8\r\n\r\n<p>123456789</p>"
+
+	got, err := BodiesFromMIME(strings.NewReader(raw), int64(len(raw)), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HTML != "<p>1234" {
+		t.Fatalf("html body = %q; want the budget to truncate it", got.HTML)
+	}
+}
+
 func FuzzParseMIMEMessage(f *testing.F) {
 	f.Add([]byte("Subject: hello\r\n\r\nbody"))
 	f.Add([]byte("Content-Type: multipart/mixed; boundary=x\r\n\r\n--x--\r\n"))

@@ -724,6 +724,19 @@ func (s *Store) GetArchivedMailboxMessage(ctx context.Context, aliasID int64, ma
 	))
 }
 
+// GetArchivedMessageByID returns one archived message of the alias by its
+// archived_messages row id, including the content coordinates needed to read
+// the body back from disk.
+func (s *Store) GetArchivedMessageByID(ctx context.Context, aliasID, messageID int64) (domain.ArchivedMailboxMessage, error) {
+	return scanArchivedMailboxMessage(s.queryRowContext(ctx, `
+		SELECT `+archivedMailboxColumns+`
+		FROM alias_messages am
+		JOIN aliases al ON al.id = am.alias_id
+		JOIN archived_messages m ON m.id = am.message_id
+		WHERE am.alias_id = ? AND m.id = ?`, aliasID, messageID,
+	))
+}
+
 func scanArchivedMailboxMessage(scanner rowScanner) (domain.ArchivedMailboxMessage, error) {
 	var message domain.ArchivedMailboxMessage
 	var mailboxUID, uidValidity int64
@@ -766,7 +779,7 @@ func (s *Store) ListAliasOTPs(ctx context.Context, aliasID int64, limit int) ([]
 		limit = maxOTPHistory
 	}
 	rows, err := s.queryContext(ctx, `
-		SELECT am.otp, m.internal_date
+		SELECT am.otp, m.internal_date, m.id
 		FROM alias_messages am
 		JOIN archived_messages m ON m.id = am.message_id
 		WHERE am.alias_id = ? AND am.otp <> ''
@@ -780,7 +793,7 @@ func (s *Store) ListAliasOTPs(ctx context.Context, aliasID int64, limit int) ([]
 	for rows.Next() {
 		var record domain.OTPRecord
 		var timestampValue int64
-		if err := rows.Scan(&record.OTP, &timestampValue); err != nil {
+		if err := rows.Scan(&record.OTP, &timestampValue, &record.MessageID); err != nil {
 			return nil, fmt.Errorf("scan alias OTP history: %w", err)
 		}
 		if !domain.IsSixDigitOTP(record.OTP) || len(result) >= limit {

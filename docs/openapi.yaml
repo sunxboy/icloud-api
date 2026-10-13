@@ -228,6 +228,8 @@ paths:
         token 保持用途隔离的 v3 公开信封版本，与 recent-mail 的 v2 信封分别签名。
         这里的 v3 只表示 token 信封版本，不表示新的 alias credential mode。
         recent-mail token 和原 v1 直达 token 不授权此接口。
+        除 `token` 与 `format` 外，本接口不接受任何其他查询参数：多余参数、重复参数或无法解析的
+        查询串一律按凭证无效拒绝，不做忽略处理。
       security:
         - aliasAPIKey: []
         - derivedToken: []
@@ -239,9 +241,28 @@ paths:
           schema:
             type: string
             minLength: 1
+        - name: format
+          in: query
+          required: false
+          description: |
+            输出形态，省略时保持原有 JSON 契约。
+            `plain` 只输出最新验证码本身（以单个换行结尾）；`html` 原样输出最新验证码邮件的
+            HTML 正文，不重写其中的标签。两种形态都不消费验证码，与 JSON 形态语义一致。
+            没有验证码时两者都返回 `200` 与零字节响应体（`html` 即空白页）。有验证码、但该邮件
+            的归档正文已不可读（被清理或文件损坏）时，`html` 返回 `404 MAIL_CONTENT_UNAVAILABLE`，
+            不会静默降级成空白页。
+            `html` 优先渲染发信人提供的 HTML 部件；邮件只有纯文本时，把该文本转义后以等宽块
+            显示，不会丢一张空白页。正文以 `ICLOUD_API_MAX_BODY_BYTES` 为上限，超出部分截断。
+          schema:
+            type: string
+            enum:
+              - plain
+              - html
       responses:
         "200":
-          description: 默认是验证码历史数组；最新单条模式有记录时为对象；没有记录时为一个空数组。
+          description: |
+            默认是验证码历史数组；最新单条模式有记录时为对象；没有记录时为一个空数组。
+            `format=plain` 与 `format=html` 改用纯文本或 HTML 响应体，契约见 200 的其他媒体类型。
           headers:
             Cache-Control:
               schema:
@@ -269,8 +290,28 @@ paths:
                     time: "2026-08-11T12:00:00+08:00"
                 empty:
                   value: []
+            text/plain:
+              schema:
+                type: string
+              examples:
+                plainCode:
+                  value: |
+                    876543
+                plainEmpty:
+                  value: ""
+            text/html:
+              schema:
+                type: string
+              examples:
+                archivedEmail:
+                  value: |
+                    <html><body><a href="https://example.com/verify">Verify now</a></body></html>
+                htmlEmpty:
+                  value: ""
         "401":
           $ref: "#/components/responses/InvalidCredential"
+        "404":
+          $ref: "#/components/responses/MailContentUnavailable"
         "429":
           $ref: "#/components/responses/RateLimited"
         "503":
@@ -3651,6 +3692,14 @@ components:
             $ref: "#/components/schemas/APIErrorEnvelope"
     MailNotFound:
       description: 当前没有符合条件且尚未消费的邮件（`MAIL_NOT_FOUND`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    MailContentUnavailable:
+      description: |
+        邮件存在，但它的归档正文已不可读（归档清理后文件被移除，或文件校验失败）。
+        仅 `format=html` 会返回此响应；「没有验证码」是正常的空状态，返回 `200` 与零字节响应体。
       content:
         application/json:
           schema:

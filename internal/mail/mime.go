@@ -265,6 +265,30 @@ func parseMIMEMessageReader(reader io.Reader, rawSize int64, limits mimeLimits) 
 	return parsed, nil
 }
 
+// ReadableBodies is the readable content of an archived message: the sender's
+// HTML part when there is one, and the plain-text part alongside it. Callers
+// choose between them; the two travel together so neither is reached by
+// position.
+type ReadableBodies struct {
+	Text string
+	HTML string
+}
+
+// BodiesFromMIME re-parses a complete MIME stream and returns its readable body
+// parts. It exists for callers that hold archived raw MIME rather than a parsed
+// message: the reader is consumed incrementally, so a large message is never
+// materialized, and the result stays bounded by maxBodyBytes. As with
+// parseMIMEMessage, a non-positive maxBodyBytes is a zero budget, not a request
+// for the default.
+func BodiesFromMIME(reader io.Reader, rawSize, maxBodyBytes int64) (ReadableBodies, error) {
+	limits := defaultMIMELimits(maxBodyBytes, maxBodyBytes+defaultMetadataResultBytes)
+	parsed, err := parseMIMEMessageReader(reader, rawSize, limits)
+	if err != nil {
+		return ReadableBodies{}, err
+	}
+	return ReadableBodies{Text: parsed.textBody, HTML: parsed.htmlBody}, nil
+}
+
 func walkMIME(header textproto.MIMEHeader, body io.Reader, parsed *parsedMessage, budget *mimeBudget, maxPartBytes int64, depth int) error {
 	if depth > maxMIMEDepth || budget.partsRemaining == 0 {
 		parsed.bodyTruncated = true

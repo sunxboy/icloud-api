@@ -302,6 +302,10 @@ type ArchivedMailboxMessage struct {
 type OTPRecord struct {
 	OTP  string
 	Time time.Time
+	// MessageID is the archived_messages row the code was extracted from.
+	// Callers that need the message body use it to reach the on-disk content;
+	// the public OTP response deliberately does not expose it.
+	MessageID int64
 }
 
 // IsSixDigitOTP reports whether value is six ASCII digits, optionally separated

@@ -89,6 +89,16 @@ func (s *Server) requestContext() gin.HandlerFunc {
 	}
 }
 
+const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"
+
+// otpHTMLContentSecurityPolicy serves the archived-HTML OTP view. It relaxes
+// exactly two directives, both because that response renders third-party email
+// markup: images in email are remote URLs, and a verification page has no
+// business submitting forms. Everything that stops archived email HTML from
+// running or hijacking links stays in place, because the OTP token in the URL
+// is itself the credential. Keep this list in step with contentSecurityPolicy.
+const otpHTMLContentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src https: data:; font-src 'self' data:; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'self'"
+
 func (s *Server) securityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if pathWithin(c.Request.URL.Path, s.cfg.AdminPath) ||
@@ -100,7 +110,7 @@ func (s *Server) securityHeaders() gin.HandlerFunc {
 		c.Header("X-Frame-Options", "DENY")
 		c.Header("Referrer-Policy", "no-referrer")
 		c.Header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'")
+		c.Header("Content-Security-Policy", contentSecurityPolicy)
 		c.Next()
 	}
 }
