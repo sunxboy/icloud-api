@@ -5,8 +5,10 @@ import test from "node:test";
 import {
   ALIAS_EXPORT_IMAP,
   ALIAS_EXPORT_OTP,
+  ALIAS_EXPORT_OTP_HTML,
   buildAliasReceiveLink,
   buildAliasExportText,
+  selectAliasesForSale,
 } from "../src/utils/aliasExport.js";
 
 const aliasesViewPath = new URL("../src/views/AliasesView.vue", import.meta.url);
@@ -49,6 +51,73 @@ test("OTP export uses five hyphens, absolute links, one line per alias, and no h
       "first@icloud.com-----https://mail.example.test:8443/api/v1/otp?token=first-token",
       "second@icloud.com-----https://mail.example.test:8443/api/v1/otp?token=second%2Btoken",
     ].join("\r\n"),
+  );
+});
+
+test("sell export appends format=html to each OTP link", () => {
+  const exported = buildAliasExportText(
+    [
+      {
+        address: "34_naval.callas@icloud.com",
+        otpUrlPath: "/api/v1/otp?token=icm_example",
+      },
+    ],
+    ALIAS_EXPORT_OTP_HTML,
+    "http://127.0.0.1:8083",
+  );
+
+  assert.equal(
+    exported,
+    "34_naval.callas@icloud.com-----http://127.0.0.1:8083/api/v1/otp?token=icm_example&format=html",
+  );
+});
+
+test("sell export rejects legacy direct links", () => {
+  assert.throws(
+    () =>
+      buildAliasExportText(
+        [
+          {
+            address: "legacy@icloud.com",
+            directLinkPath: "/api/v1/mail/recent?api_key=legacy",
+          },
+        ],
+        ALIAS_EXPORT_OTP_HTML,
+        "https://mail.example.test",
+      ),
+    /取码链接格式无效/,
+  );
+});
+
+test("sale selection skips sold, disabled, legacy, and missing OTP links and caps at five", () => {
+  const aliases = Array.from({ length: 7 }, (_, index) => ({
+    id: index + 1,
+    address: `mail-${index + 1}@icloud.com`,
+    enabled: true,
+    credentialMode: "v2",
+    groupName: "",
+    otpUrlPath: `/api/v1/otp?token=token-${index + 1}`,
+  }));
+  aliases[0].groupName = "已卖";
+  aliases[1].enabled = false;
+  aliases[2].credentialMode = "legacy";
+  aliases[3].otpUrlPath = "";
+
+  assert.deepEqual(
+    selectAliasesForSale(aliases).map((alias) => alias.id),
+    [5, 6, 7],
+  );
+
+  const enough = Array.from({ length: 8 }, (_, index) => ({
+    id: index + 1,
+    enabled: true,
+    credentialMode: "v2",
+    groupName: "",
+    otpUrlPath: `/api/v1/otp?token=token-${index + 1}`,
+  }));
+  assert.deepEqual(
+    selectAliasesForSale(enough).map((alias) => alias.id),
+    [1, 2, 3, 4, 5],
   );
 });
 

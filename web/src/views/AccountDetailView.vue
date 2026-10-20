@@ -27,6 +27,43 @@
         @saved="finishForwardingSettings"
       />
       <el-dialog
+        v-model="sellDialogVisible"
+        :title="`卖出下一组（${sellAliases.length} 个）`"
+        width="min(720px, calc(100vw - 28px))"
+        :close-on-click-modal="false"
+        destroy-on-close
+        @closed="resetSellDialog"
+      >
+        <p class="field-help">
+          已排除「已卖」、停用及没有可用取码链接的邮箱；按地址顺序取前
+          {{ ALIAS_SALE_BATCH_SIZE }} 个。
+        </p>
+        <el-input
+          v-model="sellText"
+          class="sell-batch-text"
+          type="textarea"
+          :rows="6"
+          readonly
+          aria-label="卖出下一组邮箱取码链接"
+        />
+        <template #footer>
+          <el-button type="primary" :icon="CopyDocument" @click="copySellBatch">
+            复制
+          </el-button>
+          <el-button :disabled="sellMarking" @click="sellDialogVisible = false">
+            关闭
+          </el-button>
+          <el-button
+            type="warning"
+            plain
+            :loading="sellMarking"
+            @click="markSellBatchSold"
+          >
+            标记为已卖
+          </el-button>
+        </template>
+      </el-dialog>
+      <el-dialog
         v-model="appleAuthVisible"
         class="apple-auth-dialog"
         :title="appleAuthStep === 'verification' ? '输入双重认证验证码' : '登录 Apple 账户'"
@@ -236,6 +273,15 @@
               @click="openForwardingSettings"
             >
               转发设置
+            </el-button>
+            <el-button
+              v-if="!isCustomMailbox"
+              :icon="Sell"
+              :loading="sellLoading"
+              :disabled="appleAliasControlsDisabled || aliasesSyncLoading || appleDisconnectLoading || sellMarking || !account.enabled"
+              @click="openSellNextGroup"
+            >
+              卖出下一组
             </el-button>
           </template>
         </SectionHeader>
@@ -794,6 +840,7 @@ import {
   Refresh,
   RefreshLeft,
   Search,
+  Sell,
   SwitchButton,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -823,6 +870,7 @@ import {
   getMailGroups,
   loginAppleSession,
   moveAliasToGroup as moveAliasToGroupRequest,
+  moveAliasesToGroup as moveAliasesToGroupRequest,
   rotateAlias,
   setAliasAutoCreation,
   setAliasEnabled,
@@ -848,7 +896,11 @@ import {
 import {
   ALIAS_EXPORT_IMAP,
   ALIAS_EXPORT_OTP,
+  ALIAS_EXPORT_OTP_HTML,
+  ALIAS_SALE_BATCH_SIZE,
+  ALIAS_SALE_GROUP_NAME,
   buildAliasExportText,
+  selectAliasesForSale,
 } from "../utils/aliasExport.js";
 import { buildRecentMailDirectLink, copyText } from "../utils/clipboard.js";
 import {
@@ -888,6 +940,11 @@ const createLoading = ref(false);
 const accountDeleteLoading = ref(false);
 const appleDisconnectLoading = ref(false);
 const forwardingVisible = ref(false);
+const sellDialogVisible = ref(false);
+const sellText = ref("");
+const sellAliases = ref([]);
+const sellLoading = ref(false);
+const sellMarking = ref(false);
 const aliasFormRef = ref(null);
 const aliasFormError = ref(null);
 const appleAuthVisible = ref(false);
@@ -2128,6 +2185,115 @@ async function copyLegacyDirectLink(alias) {
   }
 }
 
+async function openSellNextGroup() {
+  if (sellLoading.value) return;
+  if (!account.value?.enabled) {
+    ElMessage.warning("主号已停用，无法卖出邮箱。");
+    return;
+  }
+  const accountId = account.value.id;
+  sellLoading.value = true;
+  try {
+    const items = await getAllAliases(accountId);
+    if (!isCurrentAccount(accountId)) return;
+    const selected = selectAliasesForSale(items);
+    if (!selected.length) {
+      ElMessage.warning(
+        "没有可卖出的隐私邮箱（已排除「已卖」、停用及没有可用取码链接的邮箱）。",
+      );
+      return;
+    }
+    sellAliases.value = selected;
+    sellText.value = buildAliasExportText(selected, ALIAS_EXPORT_OTP_HTML);
+    sellDialogVisible.value = true;
+    if (selected.length < ALIAS_SALE_BATCH_SIZE) {
+      ElMessage.warning(`仅剩 ${selected.length} 个可卖出的隐私邮箱。`);
+    }
+  } catch (error) {
+    if (isCurrentAccount(accountId)) {
+      showRequestError(error, "读取隐私邮箱失败，请稍后重试。");
+    }
+  } finally {
+    sellLoading.value = false;
+  }
+}
+
+function resetSellDialog() {
+  sellText.value = "";
+  sellAliases.value = [];
+}
+
+async function copySellBatch() {
+  if (!sellText.value) return;
+  try {
+    const copied = await copyText(sellText.value);
+    if (!copied) throw new Error("clipboard rejected copy");
+    successMessage(`已复制 ${sellAliases.value.length} 个邮箱的取码链接。`);
+  } catch {
+    ElMessage({
+      type: "error",
+      message: "取码链接复制失败，请检查浏览器剪切板权限后重试。",
+      grouping: true,
+    });
+  }
+}
+
+async function findSaleGroup() {
+  let group = groups.value.find((item) => item.name === ALIAS_SALE_GROUP_NAME);
+  if (group) return group;
+  await loadMailGroups();
+  return groups.value.find((item) => item.name === ALIAS_SALE_GROUP_NAME) || null;
+}
+
+async function markSellBatchSold() {
+  if (sellMarking.value || !sellAliases.value.length) return;
+  const group = await findSaleGroup();
+  if (!group) {
+    ElMessage.warning(
+      `未找到「${ALIAS_SALE_GROUP_NAME}」分组，请先在邮箱分组中创建。`,
+    );
+    return;
+  }
+  const aliases = [...sellAliases.value];
+  try {
+    await ElMessageBox.confirm(
+      `将把这 ${aliases.length} 个邮箱移入「${ALIAS_SALE_GROUP_NAME}」分组，之后它们不会再出现在「卖出下一组」中。继续吗？`,
+      "标记为已卖",
+      {
+        type: "warning",
+        confirmButtonText: "移入已卖",
+        cancelButtonText: "取消",
+        autofocus: false,
+      },
+    );
+  } catch {
+    return;
+  }
+  const accountId = account.value?.id;
+  sellMarking.value = true;
+  beginDetailMutation();
+  try {
+    await moveAliasesToGroupRequest(
+      aliases.map((alias) => alias.id),
+      group.id,
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    sellDialogVisible.value = false;
+    await loadDetail();
+    if (!isCurrentAccount(accountId)) return;
+    successMessage(
+      `已将 ${aliases.length} 个邮箱移入「${ALIAS_SALE_GROUP_NAME}」分组。`,
+    );
+  } catch (error) {
+    if (isCurrentAccount(accountId)) {
+      showRequestError(error, "移入「已卖」分组失败，请稍后重试。");
+    }
+  } finally {
+    sellMarking.value = false;
+  }
+}
+
 async function toggleAlias(alias, enabled) {
   if (
     isAliasConfirmationPending(alias) ||
@@ -2287,6 +2453,8 @@ watch(
       loading.value = false;
       cancelAppleAuth();
       forwardingVisible.value = false;
+      sellDialogVisible.value = false;
+      resetSellDialog();
       resumeForwardingAfterAuth = false;
       account.value = null;
       aliases.value = [];
@@ -2358,6 +2526,12 @@ onBeforeUnmount(() => {
   font-size: 12px;
   white-space: nowrap;
   user-select: all;
+}
+
+.sell-batch-text :deep(.el-textarea__inner) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .alias-group-select {
