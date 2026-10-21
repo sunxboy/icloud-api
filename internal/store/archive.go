@@ -21,12 +21,13 @@ import (
 )
 
 const (
-	archiveContentAvailable = domain.ArchiveContentAvailable
-	archiveContentEvicted   = domain.ArchiveContentEvicted
-	archiveContentMetadata  = domain.ArchiveContentMetadata
-	archiveContentOversized = domain.ArchiveContentOversized
-	archiveContentMissing   = domain.ArchiveContentMissing
-	maxOTPHistory           = 100
+	archiveContentAvailable  = domain.ArchiveContentAvailable
+	archiveContentEvicted    = domain.ArchiveContentEvicted
+	archiveContentMetadata   = domain.ArchiveContentMetadata
+	archiveContentOversized  = domain.ArchiveContentOversized
+	archiveContentMissing    = domain.ArchiveContentMissing
+	maxOTPHistory            = 100
+	maxRecentMailboxMessages = 100
 )
 
 type ArchiveStats struct {
@@ -701,6 +702,36 @@ func (s *Store) ListArchivedMailboxMessages(ctx context.Context, aliasID int64) 
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list archived mailbox messages: %w", err)
+	}
+	defer rows.Close()
+	var result []domain.ArchivedMailboxMessage
+	for rows.Next() {
+		message, err := scanArchivedMailboxMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, message)
+	}
+	return result, rows.Err()
+}
+
+// ListRecentArchivedMailboxMessages returns the alias's newest archived
+// messages, newest first. The HTML inbox view needs a stable order and a hard
+// ceiling: the archive retains every message, so an unbounded list would grow
+// with the mailbox.
+func (s *Store) ListRecentArchivedMailboxMessages(ctx context.Context, aliasID int64, limit int) ([]domain.ArchivedMailboxMessage, error) {
+	if limit < 1 || limit > maxRecentMailboxMessages {
+		limit = maxRecentMailboxMessages
+	}
+	rows, err := s.queryContext(ctx, `
+		SELECT `+archivedMailboxColumns+`
+		FROM alias_messages am
+		JOIN aliases al ON al.id = am.alias_id
+		JOIN archived_messages m ON m.id = am.message_id
+		WHERE am.alias_id = ? ORDER BY m.internal_date DESC, m.id DESC LIMIT ?`, aliasID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list recent archived mailbox messages: %w", err)
 	}
 	defer rows.Close()
 	var result []domain.ArchivedMailboxMessage

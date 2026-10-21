@@ -2,17 +2,16 @@ package httpserver
 
 import (
 	"errors"
-	"html"
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"icloud-api/internal/domain"
-	"icloud-api/internal/mail"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
 )
@@ -32,36 +31,57 @@ const (
 	otpFormatHTML  otpFormat = "html"
 )
 
+// otpRequest is the parsed query contract of /api/v1/otp. messageID selects
+// one archived message in the HTML format; it is never valid on its own.
+type otpRequest struct {
+	format    otpFormat
+	messageID int64
+}
+
 // validateOTPQuery enforces the whole query contract of /api/v1/otp and
-// returns the requested output format. The endpoint is public, so an unknown
+// returns the requested output shape. The endpoint is public, so an unknown
 // parameter is rejected rather than ignored: otherwise the shape of a
 // credential-bearing request would be negotiable.
-func validateOTPQuery(values url.Values) (otpFormat, bool) {
+func validateOTPQuery(values url.Values) (otpRequest, bool) {
 	for key := range values {
-		if key != "token" && key != "format" {
-			return otpFormatJSON, false
+		if key != "token" && key != "format" && key != "message" {
+			return otpRequest{}, false
 		}
 	}
-	requested := values["format"]
-	if len(requested) > 1 {
-		return otpFormatJSON, false
+	request := otpRequest{format: otpFormatJSON}
+	if requested := values["format"]; len(requested) > 1 {
+		return otpRequest{}, false
+	} else if len(requested) == 1 {
+		switch format := otpFormat(requested[0]); format {
+		case otpFormatPlain, otpFormatHTML:
+			request.format = format
+		default:
+			return otpRequest{}, false
+		}
 	}
-	if len(requested) == 0 {
-		return otpFormatJSON, true
+	if requested := values["message"]; len(requested) > 1 {
+		return otpRequest{}, false
+	} else if len(requested) == 1 {
+		raw := requested[0]
+		// The message selector only exists inside the HTML inbox. Accept ASCII
+		// digits alone so "+1", " 1" and hex are rejected rather than coerced.
+		if request.format != otpFormatHTML || raw == "" || strings.Trim(raw, "0123456789") != "" {
+			return otpRequest{}, false
+		}
+		messageID, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || messageID < 1 {
+			return otpRequest{}, false
+		}
+		request.messageID = messageID
 	}
-	switch format := otpFormat(requested[0]); format {
-	case otpFormatPlain, otpFormatHTML:
-		return format, true
-	default:
-		return otpFormatJSON, false
-	}
+	return request, true
 }
 
 // otpHistory is deliberately a repeatable cache read. Neither authentication
 // form consumes a code or changes upstream/local message flags.
 func (s *Server) otpHistory(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	binding, format, ok := s.authenticateOTPRequest(c)
+	binding, request, ok := s.authenticateOTPRequest(c)
 	if !ok {
 		return
 	}
@@ -81,22 +101,26 @@ func (s *Server) otpHistory(c *gin.Context) {
 	if err := s.store.TouchAliasAccess(c.Request.Context(), binding.Alias.ID, now); err != nil {
 		s.logger.Warn("更新 API 最近访问时间失败", "alias_id", binding.Alias.ID, "error", err, "request_id", requestID(c))
 	}
+	if request.format == otpFormatHTML {
+		if request.messageID > 0 {
+			s.writeOTPHTMLMessage(c, binding.Alias.ID, request.messageID)
+		} else {
+			s.writeOTPHTML(c, binding)
+		}
+		return
+	}
 	records, err := s.store.ListAliasOTPs(c.Request.Context(), binding.Alias.ID, 100)
 	if err != nil {
 		s.logger.Error("读取验证码归档失败", "alias_id", binding.Alias.ID, "error", err, "request_id", requestID(c))
 		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
 		return
 	}
-	switch format {
-	case otpFormatPlain:
+	if request.format == otpFormatPlain {
 		if len(records) == 0 {
 			c.Data(http.StatusOK, "text/plain; charset=utf-8", nil)
 			return
 		}
 		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(records[0].OTP+"\n"))
-		return
-	case otpFormatHTML:
-		s.writeOTPHTML(c, binding.Alias.ID, records)
 		return
 	}
 	location := s.cfg.Timezone
@@ -114,78 +138,15 @@ func (s *Server) otpHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// writeOTPHTML renders the body of the newest OTP message. HTML the sender
-// provided is passed through verbatim; the caller opted into seeing third-party
-// markup, so the bytes are not rewritten and the response instead carries a CSP
-// that keeps archived HTML from running scripts or hijacking links.
-//
-// No records is the alias's normal empty state and stays blank. A message that
-// exists but whose archive body cannot be read is reported as an error instead:
-// a blank page there would hide an eviction or a corrupt archive behind the
-// same response as "no mail yet".
-func (s *Server) writeOTPHTML(c *gin.Context, aliasID int64, records []domain.OTPRecord) {
-	c.Header("Content-Security-Policy", otpHTMLContentSecurityPolicy)
-	if len(records) == 0 {
-		c.Data(http.StatusOK, "text/html; charset=utf-8", nil)
-		return
-	}
-	message, err := s.store.GetArchivedMessageByID(c.Request.Context(), aliasID, records[0].MessageID)
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		s.writeAPIError(c, http.StatusNotFound, "MAIL_CONTENT_UNAVAILABLE", "邮件正文不可用")
-		return
-	case err != nil:
-		s.logger.Error("读取验证码邮件失败", "alias_id", aliasID, "message_id", records[0].MessageID, "error", err, "request_id", requestID(c))
-		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
-		return
-	}
-	bodies, err := s.archivedBodies(message)
-	if err != nil {
-		s.logger.Warn("验证码邮件正文不可用", "alias_id", aliasID, "message_id", message.ID, "error", err, "request_id", requestID(c))
-		s.writeAPIError(c, http.StatusNotFound, "MAIL_CONTENT_UNAVAILABLE", "邮件正文不可用")
-		return
-	}
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(renderEmailBody(bodies)))
-}
-
-// archivedBodies reads the archived raw MIME and re-parses its readable parts.
-// Every failure here says the same thing to the caller — the archived body
-// cannot be shown — so it collapses to one error instead of separating an
-// eviction from a checksum mismatch. The IMAPS path treats both as the same
-// explanatory placeholder for the same reason.
-func (s *Server) archivedBodies(message domain.ArchivedMailboxMessage) (mail.ReadableBodies, error) {
-	content, err := s.store.OpenArchivedContent(message)
-	if err != nil {
-		return mail.ReadableBodies{}, err
-	}
-	defer content.Close()
-	return mail.BodiesFromMIME(content, message.ContentBytes, s.cfg.MaxBodyBytes)
-}
-
-// renderEmailBody shows whichever body the sender provided, preferring HTML.
-// A plain-text-only message is shown as text rather than as a blank page:
-// escaping it into a <pre> keeps the line breaks the sender wrote, and the
-// escaping stops that text from being interpreted as markup. Only a message
-// with no readable body at all renders blank.
-func renderEmailBody(bodies mail.ReadableBodies) string {
-	if strings.TrimSpace(bodies.HTML) != "" {
-		return bodies.HTML
-	}
-	if strings.TrimSpace(bodies.Text) == "" {
-		return ""
-	}
-	return "<pre>" + html.EscapeString(bodies.Text) + "</pre>"
-}
-
-func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, otpFormat, bool) {
+func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, otpRequest, bool) {
 	authorization := strings.TrimSpace(c.GetHeader("Authorization"))
 	values, queryErr := url.ParseQuery(c.Request.URL.RawQuery)
 	queryTokens := values["token"]
 	queryPresent := len(queryTokens) > 0
-	format, formatOK := validateOTPQuery(values)
-	if queryErr != nil || len(queryTokens) > 1 || !formatOK || (authorization != "" && queryPresent) {
+	request, requestOK := validateOTPQuery(values)
+	if queryErr != nil || len(queryTokens) > 1 || !requestOK || (authorization != "" && queryPresent) {
 		s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
-		return domain.MailboxBinding{}, otpFormatJSON, false
+		return domain.MailboxBinding{}, otpRequest{}, false
 	}
 
 	var binding domain.MailboxBinding
@@ -194,7 +155,7 @@ func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, 
 		scheme, token, found := strings.Cut(authorization, " ")
 		if !found || !strings.EqualFold(scheme, "Bearer") || !validAPIKey(token) || strings.Contains(token, " ") {
 			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
-			return domain.MailboxBinding{}, otpFormatJSON, false
+			return domain.MailboxBinding{}, otpRequest{}, false
 		}
 		binding, err = s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), secure.HashToken(token))
 	} else if len(queryTokens) == 1 && validAPIKey(queryTokens[0]) {
@@ -218,14 +179,14 @@ func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, 
 	}
 	if errors.Is(err, store.ErrNotFound) {
 		s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
-		return domain.MailboxBinding{}, otpFormatJSON, false
+		return domain.MailboxBinding{}, otpRequest{}, false
 	}
 	if err != nil {
 		s.logger.Error("查询验证码凭证绑定失败", "error", err, "request_id", requestID(c))
 		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
-		return domain.MailboxBinding{}, otpFormatJSON, false
+		return domain.MailboxBinding{}, otpRequest{}, false
 	}
-	return binding, format, true
+	return binding, request, true
 }
 
 func (s *Server) issueIMAPAccessToken(c *gin.Context) {

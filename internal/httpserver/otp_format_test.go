@@ -5,9 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	xhtml "golang.org/x/net/html"
 
 	"icloud-api/internal/domain"
 )
@@ -44,11 +47,14 @@ func otpFormatTextOnlyRawMIME(otp string) []byte {
 }
 
 type otpFormatEnv struct {
-	env         *adminAPITestEnv
-	router      http.Handler
-	credentials domain.AliasCredentials
-	derived     string
-	emptyAPIKey string
+	env          *adminAPITestEnv
+	router       http.Handler
+	credentials  domain.AliasCredentials
+	derived      string
+	emptyAPIKey  string
+	accountID    int64
+	aliasID      int64
+	emptyAliasID int64
 }
 
 // newOTPFormatEnv archives one HTML-bearing message for the primary alias and
@@ -62,9 +68,10 @@ func newOTPFormatEnvWithMIME(t *testing.T, otp string, rawMIME []byte) otpFormat
 	t.Helper()
 	env := newAdminAPITestEnv(t)
 	env.server.sync = nil
-	// The hand-built test config leaves this at zero; production always sets it
-	// (ICLOUD_API_MAX_BODY_BYTES, validated to at least 1 KiB).
+	// The hand-built test config leaves these at zero; production always sets
+	// them (ICLOUD_API_MAX_BODY_BYTES is validated to at least 1 KiB).
 	env.server.cfg.MaxBodyBytes = 512 << 10
+	env.server.cfg.Timezone = time.UTC
 	if err := env.store.ConfigureMailArchive(t.TempDir(), 1<<20); err != nil {
 		t.Fatalf("configure mail archive: %v", err)
 	}
@@ -113,7 +120,7 @@ func newOTPFormatEnvWithMIME(t *testing.T, otp string, rawMIME []byte) otpFormat
 	}
 	// The empty alias is created only after the sync: ApplyMailboxSync silently
 	// discards a result whose enabled alias set no longer matches.
-	_, emptyCredentials := createV2AliasFixture(t, env, account.ID, "otp-format-empty@icloud.com")
+	emptyAlias, emptyCredentials := createV2AliasFixture(t, env, account.ID, "otp-format-empty@icloud.com")
 
 	router, err := env.server.Router()
 	if err != nil {
@@ -124,11 +131,14 @@ func newOTPFormatEnvWithMIME(t *testing.T, otp string, rawMIME []byte) otpFormat
 		t.Fatal(err)
 	}
 	return otpFormatEnv{
-		env:         env,
-		router:      router,
-		credentials: credentials,
-		derived:     derived,
-		emptyAPIKey: emptyCredentials.APIKey,
+		env:          env,
+		router:       router,
+		credentials:  credentials,
+		derived:      derived,
+		emptyAPIKey:  emptyCredentials.APIKey,
+		accountID:    account.ID,
+		aliasID:      alias.ID,
+		emptyAliasID: emptyAlias.ID,
 	}
 }
 
@@ -139,6 +149,48 @@ func (fixture otpFormatEnv) get(t *testing.T, path string, headers map[string]st
 		t.Fatalf("Cache-Control = %q; want no-store", response.Header().Get("Cache-Control"))
 	}
 	return response
+}
+
+func (fixture otpFormatEnv) messageID(t *testing.T) int64 {
+	t.Helper()
+	records, err := fixture.env.store.ListAliasOTPs(context.Background(), fixture.aliasID, 10)
+	if err != nil {
+		t.Fatalf("list OTP records: %v", err)
+	}
+	if len(records) == 0 {
+		t.Fatal("fixture has no archived OTP message")
+	}
+	return records[0].MessageID
+}
+
+// otpFormatIframeSrcDoc returns the reader's srcdoc after the HTML parser has
+// undone attribute escaping, which is the same byte sequence the browser feeds
+// into the sandboxed frame.
+func otpFormatIframeSrcDoc(t *testing.T, body string) string {
+	t.Helper()
+	document, err := xhtml.Parse(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse reader HTML: %v", err)
+	}
+	var srcdoc string
+	var walk func(*xhtml.Node)
+	walk = func(node *xhtml.Node) {
+		if node.Type == xhtml.ElementNode && node.Data == "iframe" {
+			for _, attribute := range node.Attr {
+				if attribute.Key == "srcdoc" {
+					srcdoc = attribute.Val
+				}
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(document)
+	if srcdoc == "" {
+		t.Fatalf("reader HTML has no srcdoc body: %q", body)
+	}
+	return srcdoc
 }
 
 func TestOTPFormatPlainReturnsBareCode(t *testing.T) {
@@ -175,7 +227,7 @@ func TestOTPFormatPlainReturnsEmptyBodyWithoutRecords(t *testing.T) {
 	}
 }
 
-func TestOTPFormatHTMLReturnsArchivedMarkupVerbatim(t *testing.T) {
+func TestOTPFormatHTMLListsArchivedMessages(t *testing.T) {
 	fixture := newOTPFormatEnv(t, "783448")
 	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html", nil)
 	if response.Code != http.StatusOK {
@@ -184,18 +236,138 @@ func TestOTPFormatHTMLReturnsArchivedMarkupVerbatim(t *testing.T) {
 	if mediaType := response.Header().Get("Content-Type"); !strings.HasPrefix(mediaType, "text/html") {
 		t.Fatalf("Content-Type = %q; want text/html", mediaType)
 	}
-	if body := response.Body.String(); body != otpFormatHTMLPart {
-		t.Fatalf("body = %q; want %q", body, otpFormatHTMLPart)
+	body := response.Body.String()
+	for _, want := range []string{
+		"邮件 (1)",
+		"otp-format-alias@icloud.com",
+		"发件人",
+		"主题",
+		"时间",
+		"操作",
+		"Your verification code",
+		"2026-08-11 03:00",
+		`aria-label="阅读"`,
+		"format=html&amp;message=" + strconv.FormatInt(fixture.messageID(t), 10) + "&amp;token=",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("list body missing %q; body=%q", want, body)
+		}
+	}
+	if strings.Contains(body, otpFormatHTMLPart) {
+		t.Fatalf("list body leaked the archived markup verbatim: %q", body)
+	}
+	if policy := response.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "img-src 'self' data:") {
+		t.Fatalf("list CSP %q is not the strict policy", policy)
+	}
+}
+
+// TestOTPFormatHTMLListsMessagesWithoutOTP pins the scope of the inbox view:
+// it is the alias's mailbox, not just the rows an OTP was extracted from.
+func TestOTPFormatHTMLListsMessagesWithoutOTP(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	ctx := context.Background()
+	aliases, err := fixture.env.store.ListAliases(ctx, fixture.accountID)
+	if err != nil {
+		t.Fatalf("list aliases: %v", err)
+	}
+	received := time.Date(2026, 8, 12, 3, 0, 0, 0, time.UTC)
+	rawMIME := []byte("Subject: Tracking Issue Alert\r\n" +
+		"From: SHEIN <noreply@sheinnotice.com>\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Your parcel is delayed.\r\n")
+	account, err := fixture.env.store.GetAccount(ctx, fixture.accountID)
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if err := fixture.env.store.ApplyMailboxSync(
+		ctx,
+		fixture.accountID,
+		account.UpdatedAt,
+		aliases,
+		domain.MailboxSyncResult{
+			ArchivedMessages: []domain.ArchivedMessage{{
+				AccountID: fixture.accountID, UIDValidity: 91, UID: 2,
+				InternalDate: received, Subject: "Tracking Issue Alert",
+				From:    []domain.MailAddress{{Name: "SHEIN", Email: "noreply@sheinnotice.com"}},
+				RawMIME: rawMIME, AliasIDs: []int64{fixture.aliasID},
+			}},
+			State: domain.IMAPSyncState{
+				AccountID: fixture.accountID, UIDValidity: 91, LastUID: 2, UpdatedAt: received,
+			},
+			// Creating the empty alias invalidated the first fixture sync's
+			// cursor, so this second publish has to establish a baseline.
+			Reset: true,
+		},
+		received,
+	); err != nil {
+		t.Fatalf("archive second message: %v", err)
+	}
+
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, want := range []string{
+		"邮件 (2)",
+		"Tracking Issue Alert",
+		"SHEIN &lt;noreply@sheinnotice.com&gt;",
+		"Your verification code",
+		"2026-08-12 03:00",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("list body missing %q; body=%q", want, body)
+		}
+	}
+	if strings.Index(body, "Tracking Issue Alert") > strings.Index(body, "Your verification code") {
+		t.Fatalf("list is not newest first: %q", body)
+	}
+}
+
+// TestOTPFormatHTMLReadsArchivedMarkupVerbatim pins that the reader still
+// hands the sender's HTML to the browser byte for byte; the sandboxed iframe is
+// the boundary that keeps it from restyling or scripting the page shell.
+func TestOTPFormatHTMLReadsArchivedMarkupVerbatim(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	messageID := fixture.messageID(t)
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+
+		"&format=html&message="+strconv.FormatInt(messageID, 10), nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
+	}
+	if mediaType := response.Header().Get("Content-Type"); !strings.HasPrefix(mediaType, "text/html") {
+		t.Fatalf("Content-Type = %q; want text/html", mediaType)
+	}
+	body := response.Body.String()
+	if srcdoc := otpFormatIframeSrcDoc(t, body); srcdoc != otpFormatHTMLPart {
+		t.Fatalf("srcdoc = %q; want %q", srcdoc, otpFormatHTMLPart)
+	}
+	for _, want := range []string{
+		"← 返回列表",
+		"Your verification code",
+		"未知发件人",
+		"2026-08-11 03:00",
+		"format=html&amp;token=",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("reader body missing %q; body=%q", want, body)
+		}
+	}
+	if strings.Contains(body, "message=") {
+		t.Fatalf("reader back link still carries the message selector: %q", body)
 	}
 }
 
 // TestOTPFormatHTMLKeepsGlobalScriptProtections pins the security shape of the
-// raw-HTML mode: only img-src and form-action may be relaxed. The directives
-// that stop archived email HTML from executing or hijacking relative links must
-// survive, because the OTP token in the URL is itself a credential.
+// reader: only img-src and form-action may be relaxed. The directives that stop
+// archived email HTML from executing or hijacking relative links must survive,
+// because the OTP token in the URL is itself a credential.
 func TestOTPFormatHTMLKeepsGlobalScriptProtections(t *testing.T) {
 	fixture := newOTPFormatEnv(t, "783448")
-	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html", nil)
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+
+		"&format=html&message="+strconv.FormatInt(fixture.messageID(t), 10), nil)
 	policy := response.Header().Get("Content-Security-Policy")
 	for _, want := range []string{
 		"img-src https: data:",
@@ -208,6 +380,10 @@ func TestOTPFormatHTMLKeepsGlobalScriptProtections(t *testing.T) {
 			t.Fatalf("Content-Security-Policy %q missing %q", policy, want)
 		}
 	}
+	if body := response.Body.String(); !strings.Contains(body, `sandbox="allow-same-origin`) ||
+		strings.Contains(body, "allow-scripts") {
+		t.Fatalf("reader iframe sandbox is wrong: %q", body)
+	}
 }
 
 // TestOTPFormatHTMLFallsBackToPlainText covers the message shape that must not
@@ -216,22 +392,23 @@ func TestOTPFormatHTMLKeepsGlobalScriptProtections(t *testing.T) {
 // becoming live markup.
 func TestOTPFormatHTMLFallsBackToPlainText(t *testing.T) {
 	fixture := newOTPFormatEnvWithMIME(t, "783448", otpFormatTextOnlyRawMIME("783448"))
-	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html", nil)
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+
+		"&format=html&message="+strconv.FormatInt(fixture.messageID(t), 10), nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
 	}
 	if mediaType := response.Header().Get("Content-Type"); !strings.HasPrefix(mediaType, "text/html") {
 		t.Fatalf("Content-Type = %q; want text/html", mediaType)
 	}
-	body := response.Body.String()
-	if !strings.HasPrefix(body, "<pre>Your code is 783448") || !strings.HasSuffix(body, "</pre>") {
-		t.Fatalf("body = %q; want the text body wrapped in <pre>", body)
+	srcdoc := otpFormatIframeSrcDoc(t, response.Body.String())
+	if !strings.HasPrefix(srcdoc, "<pre>Your code is 783448") || !strings.HasSuffix(srcdoc, "</pre>") {
+		t.Fatalf("srcdoc = %q; want the text body wrapped in <pre>", srcdoc)
 	}
-	if !strings.Contains(body, "&lt;b&gt;not markup&lt;/b&gt;") {
-		t.Fatalf("body = %q; want the text escaped", body)
+	if !strings.Contains(srcdoc, "&lt;b&gt;not markup&lt;/b&gt;") {
+		t.Fatalf("srcdoc = %q; want the text escaped", srcdoc)
 	}
-	if strings.Contains(body, "<b>not markup") {
-		t.Fatalf("body = %q; plain-text content leaked through as markup", body)
+	if strings.Contains(srcdoc, "<b>not markup") {
+		t.Fatalf("srcdoc = %q; plain-text content leaked through as markup", srcdoc)
 	}
 }
 
@@ -302,7 +479,78 @@ func TestOTPFormatHTMLReportsUnavailableArchivedContent(t *testing.T) {
 	); err != nil {
 		t.Fatalf("evict archived content: %v", err)
 	}
-	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html", nil)
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+
+		"&format=html&message="+strconv.FormatInt(fixture.messageID(t), 10), nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
+	}
+	if body := response.Body.String(); !strings.Contains(body, "MAIL_CONTENT_UNAVAILABLE") {
+		t.Fatalf("body = %q; want MAIL_CONTENT_UNAVAILABLE", body)
+	}
+}
+
+// TestOTPFormatHTMLReaderRejectsUnknownMessage keeps the archive row id from
+// becoming a cross-alias lookup: the store scopes the query to the alias.
+func TestOTPFormatHTMLReaderRejectsUnknownMessage(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html&message=999999", nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
+	}
+	if body := response.Body.String(); !strings.Contains(body, "MAIL_CONTENT_UNAVAILABLE") {
+		t.Fatalf("body = %q; want MAIL_CONTENT_UNAVAILABLE", body)
+	}
+}
+
+// TestOTPFormatHTMLReaderRejectsMessageFromAnotherAlias pins the alias scope:
+// the message row exists, but it belongs to a sibling alias on the same
+// account and therefore must not be readable with this alias's token.
+func TestOTPFormatHTMLReaderRejectsMessageFromAnotherAlias(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	ctx := context.Background()
+	aliases, err := fixture.env.store.ListAliases(ctx, fixture.accountID)
+	if err != nil {
+		t.Fatalf("list aliases: %v", err)
+	}
+	account, err := fixture.env.store.GetAccount(ctx, fixture.accountID)
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	received := time.Date(2026, 8, 12, 3, 0, 0, 0, time.UTC)
+	rawMIME := []byte("Subject: Other alias mail\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n" +
+		"Only the sibling alias may read this.\r\n")
+	if err := fixture.env.store.ApplyMailboxSync(
+		ctx,
+		fixture.accountID,
+		account.UpdatedAt,
+		aliases,
+		domain.MailboxSyncResult{
+			ArchivedMessages: []domain.ArchivedMessage{{
+				AccountID: fixture.accountID, UIDValidity: 91, UID: 2,
+				InternalDate: received, Subject: "Other alias mail",
+				RawMIME: rawMIME, OTP: "111111", AliasIDs: []int64{fixture.emptyAliasID},
+			}},
+			State: domain.IMAPSyncState{
+				AccountID: fixture.accountID, UIDValidity: 91, LastUID: 2, UpdatedAt: received,
+			},
+			Reset: true,
+		},
+		received,
+	); err != nil {
+		t.Fatalf("archive sibling alias message: %v", err)
+	}
+	records, err := fixture.env.store.ListAliasOTPs(ctx, fixture.emptyAliasID, 10)
+	if err != nil {
+		t.Fatalf("list sibling alias OTPs: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("sibling alias records = %#v; want one", records)
+	}
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+
+		"&format=html&message="+strconv.FormatInt(records[0].MessageID, 10), nil)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
 	}
@@ -324,7 +572,8 @@ func TestOTPFormatHTMLReportsCorruptedArchivedContentAsUnavailable(t *testing.T)
 	); err != nil {
 		t.Fatalf("corrupt archived content size: %v", err)
 	}
-	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+"&format=html", nil)
+	response := fixture.get(t, "/api/v1/otp?token="+url.QueryEscape(fixture.derived)+
+		"&format=html&message="+strconv.FormatInt(fixture.messageID(t), 10), nil)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
 	}
@@ -351,7 +600,8 @@ func TestOTPFormatPlainStillWorksWhenArchivedContentIsEvicted(t *testing.T) {
 }
 
 // TestOTPFormatQueryWhitelistRejectsEverythingElse keeps the original 401
-// sources intact while allowing exactly one optional format parameter.
+// sources intact while allowing exactly one format and the HTML-only message
+// selector.
 func TestOTPFormatQueryWhitelistRejectsEverythingElse(t *testing.T) {
 	fixture := newOTPFormatEnv(t, "783448")
 	token := url.QueryEscape(fixture.derived)
@@ -359,12 +609,20 @@ func TestOTPFormatQueryWhitelistRejectsEverythingElse(t *testing.T) {
 		path    string
 		headers map[string]string
 	}{
-		"unknown parameter":    {path: "/api/v1/otp?token=" + token + "&next=elsewhere"},
-		"invalid format":       {path: "/api/v1/otp?token=" + token + "&format=bogus"},
-		"empty format":         {path: "/api/v1/otp?token=" + token + "&format="},
-		"duplicate format":     {path: "/api/v1/otp?token=" + token + "&format=plain&format=html"},
-		"format without token": {path: "/api/v1/otp?format=plain"},
-		"duplicate token":      {path: "/api/v1/otp?token=" + token + "&token=" + token},
+		"unknown parameter":      {path: "/api/v1/otp?token=" + token + "&next=elsewhere"},
+		"invalid format":         {path: "/api/v1/otp?token=" + token + "&format=bogus"},
+		"empty format":           {path: "/api/v1/otp?token=" + token + "&format="},
+		"duplicate format":       {path: "/api/v1/otp?token=" + token + "&format=plain&format=html"},
+		"format without token":   {path: "/api/v1/otp?format=plain"},
+		"duplicate token":        {path: "/api/v1/otp?token=" + token + "&token=" + token},
+		"message without format": {path: "/api/v1/otp?token=" + token + "&message=1"},
+		"message with plain":     {path: "/api/v1/otp?token=" + token + "&format=plain&message=1"},
+		"empty message":          {path: "/api/v1/otp?token=" + token + "&format=html&message="},
+		"non-numeric message":    {path: "/api/v1/otp?token=" + token + "&format=html&message=abc"},
+		"zero message":           {path: "/api/v1/otp?token=" + token + "&format=html&message=0"},
+		"negative message":       {path: "/api/v1/otp?token=" + token + "&format=html&message=-1"},
+		"duplicate message":      {path: "/api/v1/otp?token=" + token + "&format=html&message=1&message=2"},
+		"message without token":  {path: "/api/v1/otp?format=html&message=1"},
 		"format plus bearer": {
 			path:    "/api/v1/otp?token=" + token + "&format=plain",
 			headers: map[string]string{"Authorization": "Bearer " + fixture.credentials.APIKey},
