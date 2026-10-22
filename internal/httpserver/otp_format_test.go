@@ -608,21 +608,22 @@ func TestOTPFormatQueryWhitelistRejectsEverythingElse(t *testing.T) {
 	for name, tc := range map[string]struct {
 		path    string
 		headers map[string]string
+		html    bool
 	}{
 		"unknown parameter":      {path: "/api/v1/otp?token=" + token + "&next=elsewhere"},
 		"invalid format":         {path: "/api/v1/otp?token=" + token + "&format=bogus"},
 		"empty format":           {path: "/api/v1/otp?token=" + token + "&format="},
-		"duplicate format":       {path: "/api/v1/otp?token=" + token + "&format=plain&format=html"},
+		"duplicate format":       {path: "/api/v1/otp?token=" + token + "&format=plain&format=html", html: true},
 		"format without token":   {path: "/api/v1/otp?format=plain"},
 		"duplicate token":        {path: "/api/v1/otp?token=" + token + "&token=" + token},
 		"message without format": {path: "/api/v1/otp?token=" + token + "&message=1"},
 		"message with plain":     {path: "/api/v1/otp?token=" + token + "&format=plain&message=1"},
-		"empty message":          {path: "/api/v1/otp?token=" + token + "&format=html&message="},
-		"non-numeric message":    {path: "/api/v1/otp?token=" + token + "&format=html&message=abc"},
-		"zero message":           {path: "/api/v1/otp?token=" + token + "&format=html&message=0"},
-		"negative message":       {path: "/api/v1/otp?token=" + token + "&format=html&message=-1"},
-		"duplicate message":      {path: "/api/v1/otp?token=" + token + "&format=html&message=1&message=2"},
-		"message without token":  {path: "/api/v1/otp?format=html&message=1"},
+		"empty message":          {path: "/api/v1/otp?token=" + token + "&format=html&message=", html: true},
+		"non-numeric message":    {path: "/api/v1/otp?token=" + token + "&format=html&message=abc", html: true},
+		"zero message":           {path: "/api/v1/otp?token=" + token + "&format=html&message=0", html: true},
+		"negative message":       {path: "/api/v1/otp?token=" + token + "&format=html&message=-1", html: true},
+		"duplicate message":      {path: "/api/v1/otp?token=" + token + "&format=html&message=1&message=2", html: true},
+		"message without token":  {path: "/api/v1/otp?format=html&message=1", html: true},
 		"format plus bearer": {
 			path:    "/api/v1/otp?token=" + token + "&format=plain",
 			headers: map[string]string{"Authorization": "Bearer " + fixture.credentials.APIKey},
@@ -630,6 +631,12 @@ func TestOTPFormatQueryWhitelistRejectsEverythingElse(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			response := serveV2Request(fixture.router, http.MethodGet, tc.path, "", tc.headers)
+			if tc.html {
+				if response.Code != http.StatusOK || response.Body.Len() != 0 {
+					t.Fatalf("status = %d; body=%q; want blank HTML page", response.Code, response.Body.String())
+				}
+				return
+			}
 			if response.Code != http.StatusUnauthorized {
 				t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
 			}

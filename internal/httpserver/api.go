@@ -77,11 +77,46 @@ func validateOTPQuery(values url.Values) (otpRequest, bool) {
 	return request, true
 }
 
+// otpWantsHTML reports whether the request asks for the browser-facing HTML
+// shape. It deliberately inspects the raw query before validation: a malformed
+// credential request that mentions format=html still gets a blank page instead
+// of a JSON error.
+func otpWantsHTML(rawQuery string) bool {
+	values, _ := url.ParseQuery(rawQuery)
+	for _, format := range values["format"] {
+		if otpFormat(format) == otpFormatHTML {
+			return true
+		}
+	}
+	return false
+}
+
+// writeOTPAuthFailure keeps the JSON error contract for API clients while
+// leaving browser-facing HTML requests blank. An empty 200 is indistinguishable
+// from an alias with no archived mail, so scanners and stale links learn
+// nothing about why the credential was rejected.
+func (s *Server) writeOTPAuthFailure(c *gin.Context, htmlRequest bool, status int, code, message string) {
+	if htmlRequest {
+		c.Data(http.StatusOK, "text/html; charset=utf-8", nil)
+		return
+	}
+	s.writeAPIError(c, status, code, message)
+}
+
 // otpHistory is deliberately a repeatable cache read. Neither authentication
 // form consumes a code or changes upstream/local message flags.
 func (s *Server) otpHistory(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	binding, request, ok := s.authenticateOTPRequest(c)
+	htmlRequest := otpWantsHTML(c.Request.URL.RawQuery)
+	// Only invalid credentials consume this budget. A verified credential
+	// refunds its reservation below, so normal polling never trips the limit;
+	// checking first still keeps an invalid flood away from the store.
+	limiterKey := c.ClientIP()
+	if !s.otpInvalidLimiter.Allow(limiterKey) {
+		s.writeOTPAuthFailure(c, htmlRequest, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
+		return
+	}
+	binding, request, ok := s.authenticateOTPRequest(c, htmlRequest)
 	if !ok {
 		return
 	}
@@ -90,9 +125,10 @@ func (s *Server) otpHistory(c *gin.Context) {
 	// hash happens to remain on the row.
 	if binding.Alias.CredentialMode != domain.AliasCredentialModeV2 ||
 		!binding.Alias.Enabled || !binding.Account.Enabled {
-		s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
+		s.writeOTPAuthFailure(c, htmlRequest, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 		return
 	}
+	s.otpInvalidLimiter.Refund(limiterKey)
 	now := time.Now().UTC()
 	if s.now != nil {
 		now = s.now().UTC()
@@ -138,14 +174,14 @@ func (s *Server) otpHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, otpRequest, bool) {
+func (s *Server) authenticateOTPRequest(c *gin.Context, htmlRequest bool) (domain.MailboxBinding, otpRequest, bool) {
 	authorization := strings.TrimSpace(c.GetHeader("Authorization"))
 	values, queryErr := url.ParseQuery(c.Request.URL.RawQuery)
 	queryTokens := values["token"]
 	queryPresent := len(queryTokens) > 0
 	request, requestOK := validateOTPQuery(values)
 	if queryErr != nil || len(queryTokens) > 1 || !requestOK || (authorization != "" && queryPresent) {
-		s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
+		s.writeOTPAuthFailure(c, htmlRequest, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 		return domain.MailboxBinding{}, otpRequest{}, false
 	}
 
@@ -154,7 +190,7 @@ func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, 
 	if authorization != "" {
 		scheme, token, found := strings.Cut(authorization, " ")
 		if !found || !strings.EqualFold(scheme, "Bearer") || !validAPIKey(token) || strings.Contains(token, " ") {
-			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
+			s.writeOTPAuthFailure(c, htmlRequest, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 			return domain.MailboxBinding{}, otpRequest{}, false
 		}
 		binding, err = s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), secure.HashToken(token))
@@ -178,12 +214,12 @@ func (s *Server) authenticateOTPRequest(c *gin.Context) (domain.MailboxBinding, 
 		err = store.ErrNotFound
 	}
 	if errors.Is(err, store.ErrNotFound) {
-		s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
+		s.writeOTPAuthFailure(c, htmlRequest, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 		return domain.MailboxBinding{}, otpRequest{}, false
 	}
 	if err != nil {
 		s.logger.Error("查询验证码凭证绑定失败", "error", err, "request_id", requestID(c))
-		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
+		s.writeOTPAuthFailure(c, htmlRequest, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
 		return domain.MailboxBinding{}, otpRequest{}, false
 	}
 	return binding, request, true

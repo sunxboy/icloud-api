@@ -25,6 +25,7 @@
 https://HOST/api/v1/otp?token=DERIVED_TOKEN&amp;format=html
 https://HOST/api/v1/otp?token=DERIVED_TOKEN&amp;format=html&amp;message=MESSAGE_ID</pre>
   <p><code>format=plain</code> 的响应体就是最新验证码本身，Content-Type 为 <code>text/plain</code>。<code>format=html</code> 返回该隐私邮箱的归档邮件列表，最新优先、最多 100 封，包括没有提取到验证码的邮件；没有归档邮件时返回 <code>200</code> 与零字节响应体。</p>
+  <p>无效凭证按来源 IP 限流：同一 IP 每分钟最多 30 次无效请求，超出后 JSON 与 <code>format=plain</code> 返回 <code>429 RATE_LIMITED</code>；<code>format=html</code> 的无效或被限流请求一律返回 <code>200</code> 空白页。有效凭证不占用该额度，正常轮询不会被限流。</p>
   <p><code>format=html&amp;message=ID</code> 返回单封邮件阅读页：用 token 打开时，顶部是发件人、主题、时间与「返回列表」，正文放在沙箱 iframe 中。发信人提供的 HTML 按原字节渲染，所以图片和按钮都能正常加载与点击；只有纯文本时，把文本转义后以等宽块显示。邮件正文已被清理或校验失败，或 <code>message</code> 不属于当前隐私邮箱时，返回 <code>404 MAIL_CONTENT_UNAVAILABLE</code>，不会静默降级成空白页。正文以 <code>ICLOUD_API_MAX_BODY_BYTES</code>（默认 512 KiB）为上限，超出的部分会被截断。</p>
   <p>阅读页渲染的是不可信的第三方邮件内容，该响应保留 <code>script-src 'self'</code> 与 <code>base-uri 'self'</code>，只放宽 <code>img-src</code> 以允许外链图片，并把 <code>form-action</code> 收紧为 <code>'none'</code>。正文额外放在不带 <code>allow-scripts</code> 的沙箱 iframe 中，邮件 CSS 也不会影响返回栏。注意放开外链图片意味着发信人可以通过图片 URL 得知你何时打开了阅读页。</p>
   <p>验证码从邮件主题、纯文本和 HTML 可读文本中提取，支持连续的 6 位 ASCII 数字及 Grok 使用的三位数字加连字符再加三位数字（如 <code>610-313</code>），返回时保留连字符。候选不能与字母或数字相邻，也不会从更长的连字符分组号码中截取片段；升级前保存的其他格式历史值也不会出现在 OTP API 响应中。</p>

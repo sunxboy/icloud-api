@@ -69,6 +69,24 @@ func (l *windowLimiter) Allow(key string) bool {
 	return entry.count <= l.limit
 }
 
+// Refund returns one slot reserved by Allow. It is used when a request turns
+// out to be exempt from the limit that guarded it.
+func (l *windowLimiter) Refund(key string) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, ok := l.items[key]
+	if !ok || !entry.reset.After(now) {
+		return
+	}
+	if entry.count <= 1 {
+		delete(l.items, key)
+		return
+	}
+	entry.count--
+	l.items[key] = entry
+}
+
 func (s *Server) requestContext() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestID, err := secure.RandomToken(12)

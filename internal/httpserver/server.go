@@ -56,6 +56,7 @@ type Server struct {
 	loginRequestLimiter       *windowLimiter
 	credentialRotationLimiter *windowLimiter
 	externalAPILimiter        *windowLimiter
+	otpInvalidLimiter         *windowLimiter
 	oauthTokenHash            []byte
 	oauthTokenConfigured      bool
 }
@@ -203,6 +204,7 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 		loginRequestLimiter:       newWindowLimiter(60, time.Minute),
 		credentialRotationLimiter: newWindowLimiter(5, 15*time.Minute),
 		externalAPILimiter:        newWindowLimiter(300, time.Minute),
+		otpInvalidLimiter:         newWindowLimiter(30, time.Minute),
 		oauthTokenHash:            oauthTokenHash,
 		oauthTokenConfigured:      oauthTokenConfigured,
 	}, nil

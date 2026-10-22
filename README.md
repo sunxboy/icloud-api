@@ -203,6 +203,8 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN&format=html&message=MESSAGE_ID
 
 `format=plain` 的响应体就是验证码本身（例如 `876543`），Content-Type 为 `text/plain`。`format=html` 返回该隐私邮箱的归档邮件列表，最新优先、最多 100 封，包括没有提取到验证码的邮件；没有归档邮件时返回 `200` 与零字节响应体。
 
+`/api/v1/otp` 对无效凭证按来源 IP 限流：同一 IP 每分钟最多 30 次无效请求，超出后 JSON 与 `format=plain` 返回 `429 RATE_LIMITED`，`format=html`（包括无效或被限流的请求）一律返回 `200` 与零字节响应体。有效凭证在验签成功后归还本次名额，因此正常轮询不会被限流；代价是同一 IP 的无效请求打满额度后，该 IP 上的有效请求也会在窗口结束前被拒绝。
+
 `format=html&message=<id>` 返回单封邮件的阅读页：用 token 打开时，顶部是发件人、主题、时间与「返回列表」，正文放在沙箱 iframe 中。发信人提供的 HTML 仍按原字节渲染，所以图片和按钮都能正常加载与点击；纯文本邮件则转义后以等宽块显示。`message` 必须属于当前 token 绑定的隐私邮箱，否则与正文已清理、校验失败一样返回 `404 MAIL_CONTENT_UNAVAILABLE`。正文以 `ICLOUD_API_MAX_BODY_BYTES`（默认 512 KiB）为上限，超出的部分会被截断。页面里的阅读链接会保留 URL 中的 token；用 Bearer 调用时链接不带凭据，请继续用携带 `Authorization` 的请求访问 `format=html&message=ID`。管理界面「复制取码格式」生成的链接始终不带 `format`，需要这些形态时请手动拼接参数。
 
 阅读页渲染的是不可信的第三方邮件内容，因此该响应单独使用一份 CSP：保留 `script-src 'self'`（邮件内脚本不会执行）和 `base-uri 'self'`（防止邮件塞 `<base>` 劫持正文里的相对链接），只放宽 `img-src` 以允许外链图片，并把 `form-action` 收紧为 `'none'`。正文额外放在不带 `allow-scripts` 的沙箱 iframe 中，因此邮件的 CSS 也不会影响页面的返回栏。注意：放开外链图片意味着发信人可以通过图片 URL 得知你何时打开了阅读页。
