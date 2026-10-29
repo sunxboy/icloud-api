@@ -32,6 +32,8 @@ type otpInboxMessageView struct {
 type otpInboxView struct {
 	Address  string
 	Count    int
+	FetchURL string
+	Notice   bool
 	Messages []otpInboxMessageView
 }
 
@@ -55,7 +57,11 @@ var otpInboxPage = template.Must(template.New("otp-inbox").Parse(`<!doctype html
 body{margin:0;background:#f5f6f7;color:#1f2328;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
 .page{max-width:1200px;margin:0 auto;padding:24px}
 h1{font-size:20px;margin:0 0 4px}
-.alias{color:#59636e;font-size:13px;margin:0 0 16px;word-break:break-all}
+.alias{color:#59636e;font-size:13px;margin:0;word-break:break-all}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 16px}
+.fetch{flex:none;color:#fff;background:#0969da;text-decoration:none;padding:6px 14px;border-radius:6px}
+.fetch:hover{background:#0550ae}
+.notice{margin:-8px 0 16px;color:#59636e;font-size:13px}
 .panel{background:#fff;border:1px solid #d8dee4;border-radius:8px;overflow:hidden}
 table{width:100%;border-collapse:collapse;table-layout:fixed}
 th,td{padding:12px 16px;text-align:left;border-bottom:1px solid #eaeef2}
@@ -75,8 +81,12 @@ tbody tr:hover{background:#f6f8fa}
 <body>
 <div class="page">
 <h1>邮件 ({{.Count}})</h1>
+<div class="bar">
 <p class="alias">{{.Address}}</p>
-<div class="panel">
+<a class="fetch" href="{{.FetchURL}}">收取邮件</a>
+</div>
+{{if .Notice}}<p class="notice">已请求收取，请稍后再次点击查看</p>
+{{end}}<div class="panel">
 <table>
 <thead><tr><th class="sender">发件人</th><th class="subject">主题</th><th class="time">时间</th><th class="action">操作</th></tr></thead>
 <tbody>
@@ -130,8 +140,9 @@ iframe{display:block;width:100%;height:100%;border:1px solid #d8dee4;border-radi
 </html>
 `))
 
-// writeOTPHTML renders the alias's inbox. No records is still the alias's
-// normal empty state and stays blank, matching the JSON and plain-text forms.
+// writeOTPHTML renders the alias's inbox. No records still renders the page
+// shell with the address masked, so it looks exactly like a rejected
+// credential (ADR 0003).
 func (s *Server) writeOTPHTML(c *gin.Context, binding domain.MailboxBinding) {
 	messages, err := s.store.ListRecentArchivedMailboxMessages(c.Request.Context(), binding.Alias.ID, otpHTMLMessageLimit)
 	if err != nil {
@@ -139,21 +150,18 @@ func (s *Server) writeOTPHTML(c *gin.Context, binding domain.MailboxBinding) {
 		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
 		return
 	}
-	if len(messages) == 0 {
-		c.Data(http.StatusOK, "text/html; charset=utf-8", nil)
-		return
-	}
-	view := otpInboxView{
-		Address:  binding.Alias.Address,
-		Count:    len(messages),
-		Messages: make([]otpInboxMessageView, 0, len(messages)),
+	view := newOTPInboxView(c)
+	view.Count = len(messages)
+	if len(messages) > 0 {
+		view.Address = binding.Alias.Address
+		view.Messages = make([]otpInboxMessageView, 0, len(messages))
 	}
 	for _, message := range messages {
 		view.Messages = append(view.Messages, otpInboxMessageView{
 			Sender:  formatMailAddresses(message.From),
 			Subject: message.Subject,
 			Time:    s.otpDisplayTime(message.InternalDate),
-			ReadURL: otpHTMLURL(c, message.ID),
+			ReadURL: otpHTMLURL(c, message.ID, false),
 		})
 	}
 	s.writeOTPPage(c, otpInboxPage, view)
@@ -194,7 +202,7 @@ func (s *Server) writeOTPHTMLMessage(c *gin.Context, aliasID, messageID int64) {
 		HasBody: body != "",
 	}
 	if c.Query("token") != "" {
-		view.BackURL = otpHTMLURL(c, 0)
+		view.BackURL = otpHTMLURL(c, 0, false)
 	}
 	s.writeOTPPage(c, otpReaderPage, view)
 }
@@ -209,10 +217,25 @@ func (s *Server) writeOTPPage(c *gin.Context, page *template.Template, view any)
 	c.Data(http.StatusOK, "text/html; charset=utf-8", output.Bytes())
 }
 
+// otpInboxMaskedAddress stands in for the address whenever the inbox is empty,
+// so a valid alias without mail and a rejected credential render identically.
+const otpInboxMaskedAddress = "—"
+
+// newOTPInboxView is the empty shell shared by every inbox response, so the
+// rejected-credential page and the no-mail page cannot drift apart.
+func newOTPInboxView(c *gin.Context) otpInboxView {
+	return otpInboxView{
+		Address:  otpInboxMaskedAddress,
+		FetchURL: otpHTMLURL(c, 0, true),
+		Notice:   otpFetchRequested(c.Request.URL.RawQuery),
+	}
+}
+
 // otpHTMLURL rebuilds this endpoint's URL without the message parameter, or
-// with it when messageID is positive. The OTP token stays in the link because
-// it is the only credential a browser can replay.
-func otpHTMLURL(c *gin.Context, messageID int64) string {
+// with it when messageID is positive; fetch adds the "收取邮件" parameter. The
+// OTP token stays in the link because it is the only credential a browser can
+// replay.
+func otpHTMLURL(c *gin.Context, messageID int64, fetch bool) string {
 	values := url.Values{}
 	if token := c.Query("token"); token != "" {
 		values.Set("token", token)
@@ -220,6 +243,9 @@ func otpHTMLURL(c *gin.Context, messageID int64) string {
 	values.Set("format", "html")
 	if messageID > 0 {
 		values.Set("message", strconv.FormatInt(messageID, 10))
+	}
+	if fetch {
+		values.Set("fetch", "1")
 	}
 	return c.Request.URL.Path + "?" + values.Encode()
 }

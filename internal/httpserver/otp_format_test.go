@@ -247,6 +247,8 @@ func TestOTPFormatHTMLListsArchivedMessages(t *testing.T) {
 		"Your verification code",
 		"2026-08-11 03:00",
 		`aria-label="阅读"`,
+		"收取邮件",
+		"fetch=1&amp;format=html&amp;token=",
 		"format=html&amp;message=" + strconv.FormatInt(fixture.messageID(t), 10) + "&amp;token=",
 	} {
 		if !strings.Contains(body, want) {
@@ -451,7 +453,11 @@ func TestOTPFormatNonHTMLKeepsStrictContentSecurityPolicy(t *testing.T) {
 	}
 }
 
-func TestOTPFormatHTMLReturnsEmptyBodyWithoutRecords(t *testing.T) {
+const otpFetchNotice = "已请求收取，请稍后再次点击查看"
+
+// TestOTPFormatHTMLRendersInboxShellWithoutRecords pins ADR 0003: an alias with
+// no archived mail still gets the inbox page, with the address slot masked.
+func TestOTPFormatHTMLRendersInboxShellWithoutRecords(t *testing.T) {
 	fixture := newOTPFormatEnv(t, "783448")
 	response := fixture.get(t, "/api/v1/otp?format=html", map[string]string{
 		"Authorization": "Bearer " + fixture.emptyAPIKey,
@@ -462,8 +468,136 @@ func TestOTPFormatHTMLReturnsEmptyBodyWithoutRecords(t *testing.T) {
 	if mediaType := response.Header().Get("Content-Type"); !strings.HasPrefix(mediaType, "text/html") {
 		t.Fatalf("Content-Type = %q; want text/html", mediaType)
 	}
-	if body := response.Body.String(); body != "" {
-		t.Fatalf("body = %q; want zero bytes", body)
+	body := response.Body.String()
+	for _, want := range []string{
+		"邮件 (0)",
+		`<p class="alias">—</p>`,
+		`href="/api/v1/otp?fetch=1&amp;format=html"`,
+		"收取邮件",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("shell body missing %q; body=%q", want, body)
+		}
+	}
+	if strings.Contains(body, "<td") {
+		t.Fatalf("shell body lists rows for an empty mailbox: %q", body)
+	}
+	if strings.Contains(body, otpFetchNotice) {
+		t.Fatalf("shell body shows the fetch notice without fetch=1: %q", body)
+	}
+}
+
+// TestOTPFormatHTMLInvalidCredentialsLookLikeEmptyMailbox pins the anti-probing
+// rule of ADR 0003: status, headers and page body must not reveal whether the
+// credential was accepted.
+func TestOTPFormatHTMLInvalidCredentialsLookLikeEmptyMailbox(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	valid := fixture.get(t, "/api/v1/otp?format=html", map[string]string{
+		"Authorization": "Bearer " + fixture.emptyAPIKey,
+	})
+	if !strings.Contains(valid.Body.String(), "收取邮件") {
+		t.Fatalf("empty mailbox did not render the shell: %q", valid.Body.String())
+	}
+	for name, headers := range map[string]map[string]string{
+		"unknown bearer":   {"Authorization": "Bearer " + strings.Repeat("a", len(fixture.emptyAPIKey))},
+		"malformed bearer": {"Authorization": "Bearer nope"},
+		"no credential":    nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := fixture.get(t, "/api/v1/otp?format=html", headers)
+			if response.Code != valid.Code {
+				t.Fatalf("status = %d; want %d", response.Code, valid.Code)
+			}
+			if got, want := response.Header().Get("Content-Type"), valid.Header().Get("Content-Type"); got != want {
+				t.Fatalf("Content-Type = %q; want %q", got, want)
+			}
+			if got, want := response.Body.String(), valid.Body.String(); got != want {
+				t.Fatalf("invalid credential body differs from empty mailbox\ngot:  %q\nwant: %q", got, want)
+			}
+		})
+	}
+	bogus := fixture.get(t, "/api/v1/otp?format=html&token=bogus", nil)
+	for _, want := range []string{"邮件 (0)", `<p class="alias">—</p>`, "收取邮件"} {
+		if !strings.Contains(bogus.Body.String(), want) {
+			t.Fatalf("bogus token body missing %q; body=%q", want, bogus.Body.String())
+		}
+	}
+	if strings.Contains(bogus.Body.String(), "<td") {
+		t.Fatalf("bogus token page lists rows: %q", bogus.Body.String())
+	}
+}
+
+// TestOTPFormatHTMLFetchNoticeDependsOnlyOnFetchParameter pins that the notice
+// row cannot be used to tell valid credentials from invalid ones.
+func TestOTPFormatHTMLFetchNoticeDependsOnlyOnFetchParameter(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	token := url.QueryEscape(fixture.derived)
+	for name, tc := range map[string]struct {
+		path    string
+		headers map[string]string
+	}{
+		"valid with mail":    {path: "/api/v1/otp?format=html&fetch=1&token=" + token},
+		"valid without mail": {path: "/api/v1/otp?format=html&fetch=1", headers: map[string]string{"Authorization": "Bearer " + fixture.emptyAPIKey}},
+		"invalid bearer":     {path: "/api/v1/otp?format=html&fetch=1", headers: map[string]string{"Authorization": "Bearer nope"}},
+		"invalid token":      {path: "/api/v1/otp?format=html&fetch=1&token=bogus"},
+		"no credential":      {path: "/api/v1/otp?format=html&fetch=1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := fixture.get(t, tc.path, tc.headers)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d; body=%q", response.Code, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), otpFetchNotice) {
+				t.Fatalf("fetch=1 body missing notice %q; body=%q", otpFetchNotice, response.Body.String())
+			}
+		})
+	}
+	for name, path := range map[string]string{
+		"valid":           "/api/v1/otp?format=html&token=" + token,
+		"invalid":         "/api/v1/otp?format=html&token=bogus",
+		"fetch=2":         "/api/v1/otp?format=html&fetch=2&token=" + token,
+		"duplicate fetch": "/api/v1/otp?format=html&fetch=1&fetch=1&token=" + token,
+	} {
+		t.Run("no notice "+name, func(t *testing.T) {
+			if body := fixture.get(t, path, nil).Body.String(); strings.Contains(body, otpFetchNotice) {
+				t.Fatalf("body shows the notice without a single fetch=1: %q", body)
+			}
+		})
+	}
+	valid := fixture.get(t, "/api/v1/otp?format=html&fetch=1", map[string]string{"Authorization": "Bearer " + fixture.emptyAPIKey})
+	invalid := fixture.get(t, "/api/v1/otp?format=html&fetch=1", map[string]string{"Authorization": "Bearer nope"})
+	if valid.Body.String() != invalid.Body.String() {
+		t.Fatalf("fetch=1 pages differ\nvalid:   %q\ninvalid: %q", valid.Body.String(), invalid.Body.String())
+	}
+}
+
+// TestOTPFormatHTMLFetchDoesNotSyncForInvalidCredentials pins ADR 0003: the
+// button must not become a way to wake the syncer without a valid credential.
+func TestOTPFormatHTMLFetchDoesNotSyncForInvalidCredentials(t *testing.T) {
+	fixture := newOTPFormatEnv(t, "783448")
+	synced := make(chan int64, 4)
+	fixture.env.server.sync = func(accountID int64) error {
+		synced <- accountID
+		return nil
+	}
+	for _, headers := range []map[string]string{
+		nil,
+		{"Authorization": "Bearer nope"},
+	} {
+		fixture.get(t, "/api/v1/otp?format=html&fetch=1&token=bogus", headers)
+	}
+	// Positive control: a valid request does wake the syncer, so an empty
+	// channel above cannot be a broken hook.
+	fixture.get(t, "/api/v1/otp?format=html&fetch=1&token="+url.QueryEscape(fixture.derived), nil)
+	select {
+	case <-synced:
+	case <-time.After(2 * time.Second):
+		t.Fatal("valid request did not trigger a sync")
+	}
+	select {
+	case accountID := <-synced:
+		t.Fatalf("an extra sync (account %d) ran; invalid credentials must not trigger one", accountID)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -624,6 +758,11 @@ func TestOTPFormatQueryWhitelistRejectsEverythingElse(t *testing.T) {
 		"negative message":       {path: "/api/v1/otp?token=" + token + "&format=html&message=-1", html: true},
 		"duplicate message":      {path: "/api/v1/otp?token=" + token + "&format=html&message=1&message=2", html: true},
 		"message without token":  {path: "/api/v1/otp?format=html&message=1", html: true},
+		"fetch without format":   {path: "/api/v1/otp?token=" + token + "&fetch=1"},
+		"fetch with plain":       {path: "/api/v1/otp?token=" + token + "&format=plain&fetch=1"},
+		"fetch wrong value":      {path: "/api/v1/otp?token=" + token + "&format=html&fetch=2", html: true},
+		"empty fetch":            {path: "/api/v1/otp?token=" + token + "&format=html&fetch=", html: true},
+		"duplicate fetch":        {path: "/api/v1/otp?token=" + token + "&format=html&fetch=1&fetch=1", html: true},
 		"format plus bearer": {
 			path:    "/api/v1/otp?token=" + token + "&format=plain",
 			headers: map[string]string{"Authorization": "Bearer " + fixture.credentials.APIKey},
@@ -632,8 +771,9 @@ func TestOTPFormatQueryWhitelistRejectsEverythingElse(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			response := serveV2Request(fixture.router, http.MethodGet, tc.path, "", tc.headers)
 			if tc.html {
-				if response.Code != http.StatusOK || response.Body.Len() != 0 {
-					t.Fatalf("status = %d; body=%q; want blank HTML page", response.Code, response.Body.String())
+				body := response.Body.String()
+				if response.Code != http.StatusOK || !strings.Contains(body, `<p class="alias">—</p>`) || strings.Contains(body, "<td") {
+					t.Fatalf("status = %d; body=%q; want the empty inbox shell", response.Code, body)
 				}
 				return
 			}

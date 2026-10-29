@@ -74,17 +74,21 @@ func TestOTPValidRequestsDoNotConsumeInvalidBudget(t *testing.T) {
 	}
 }
 
-func TestOTPHTMLInvalidTokenAlwaysReturnsBlankPage(t *testing.T) {
+func TestOTPHTMLInvalidTokenAlwaysReturnsInboxShell(t *testing.T) {
 	fixture := newOTPFormatEnv(t, "783448")
 	path := "/api/v1/otp?token=" + url.QueryEscape(otpUnknownToken(t)) + "&format=html"
-	// The 31st request exceeds the invalid-token budget but must stay blank.
+	// The 31st request exceeds the invalid-token budget but must look the same.
+	first := serveV2Request(fixture.router, http.MethodGet, path, "", nil).Body.String()
+	if !strings.Contains(first, `<p class="alias">—</p>`) {
+		t.Fatalf("first body = %q; want the inbox shell", first)
+	}
 	for attempt := 1; attempt <= 31; attempt++ {
 		response := serveV2Request(fixture.router, http.MethodGet, path, "", nil)
 		if response.Code != http.StatusOK {
 			t.Fatalf("attempt %d status = %d; body=%q", attempt, response.Code, response.Body.String())
 		}
-		if response.Body.Len() != 0 {
-			t.Fatalf("attempt %d body = %q; want blank", attempt, response.Body.String())
+		if response.Body.String() != first {
+			t.Fatalf("attempt %d body = %q; want the same inbox shell as attempt 1", attempt, response.Body.String())
 		}
 		if mediaType := response.Header().Get("Content-Type"); !strings.HasPrefix(mediaType, "text/html") {
 			t.Fatalf("attempt %d Content-Type = %q; want text/html", attempt, mediaType)
@@ -92,7 +96,7 @@ func TestOTPHTMLInvalidTokenAlwaysReturnsBlankPage(t *testing.T) {
 	}
 }
 
-func TestOTPHTMLMalformedQueryReturnsBlankPage(t *testing.T) {
+func TestOTPHTMLMalformedQueryReturnsInboxShell(t *testing.T) {
 	fixture := newOTPFormatEnv(t, "783448")
 	token := url.QueryEscape(fixture.derived)
 	for name, path := range map[string]string{
@@ -102,8 +106,8 @@ func TestOTPHTMLMalformedQueryReturnsBlankPage(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			response := serveV2Request(fixture.router, http.MethodGet, path, "", nil)
-			if response.Code != http.StatusOK || response.Body.Len() != 0 {
-				t.Fatalf("status = %d body = %q; want blank 200", response.Code, response.Body.String())
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `<p class="alias">—</p>`) {
+				t.Fatalf("status = %d body = %q; want 200 inbox shell", response.Code, response.Body.String())
 			}
 		})
 	}

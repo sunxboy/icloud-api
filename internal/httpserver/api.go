@@ -44,7 +44,7 @@ type otpRequest struct {
 // credential-bearing request would be negotiable.
 func validateOTPQuery(values url.Values) (otpRequest, bool) {
 	for key := range values {
-		if key != "token" && key != "format" && key != "message" {
+		if key != "token" && key != "format" && key != "message" && key != "fetch" {
 			return otpRequest{}, false
 		}
 	}
@@ -74,13 +74,31 @@ func validateOTPQuery(values url.Values) (otpRequest, bool) {
 		}
 		request.messageID = messageID
 	}
+	if requested := values["fetch"]; len(requested) > 1 {
+		return otpRequest{}, false
+	} else if len(requested) == 1 {
+		// Like message, fetch only exists on the HTML inbox, and "1" is its
+		// sole value so the link stays a fixed, non-negotiable shape.
+		if request.format != otpFormatHTML || requested[0] != "1" {
+			return otpRequest{}, false
+		}
+	}
 	return request, true
+}
+
+// otpFetchRequested reports whether the raw query carries exactly one fetch=1.
+// It reads the raw query rather than the validated request so the notice row
+// shows up for rejected credentials too: its visibility must depend on the
+// URL alone, never on whether the credential was accepted.
+func otpFetchRequested(rawQuery string) bool {
+	values, _ := url.ParseQuery(rawQuery)
+	return len(values["fetch"]) == 1 && values["fetch"][0] == "1"
 }
 
 // otpWantsHTML reports whether the request asks for the browser-facing HTML
 // shape. It deliberately inspects the raw query before validation: a malformed
-// credential request that mentions format=html still gets a blank page instead
-// of a JSON error.
+// credential request that mentions format=html still gets the inbox shell
+// instead of a JSON error.
 func otpWantsHTML(rawQuery string) bool {
 	values, _ := url.ParseQuery(rawQuery)
 	for _, format := range values["format"] {
@@ -92,12 +110,12 @@ func otpWantsHTML(rawQuery string) bool {
 }
 
 // writeOTPAuthFailure keeps the JSON error contract for API clients while
-// leaving browser-facing HTML requests blank. An empty 200 is indistinguishable
-// from an alias with no archived mail, so scanners and stale links learn
-// nothing about why the credential was rejected.
+// answering browser-facing HTML requests with the empty inbox shell. That page
+// is identical to an alias with no archived mail, so scanners and stale links
+// learn nothing about why the credential was rejected.
 func (s *Server) writeOTPAuthFailure(c *gin.Context, htmlRequest bool, status int, code, message string) {
 	if htmlRequest {
-		c.Data(http.StatusOK, "text/html; charset=utf-8", nil)
+		s.writeOTPPage(c, otpInboxPage, newOTPInboxView(c))
 		return
 	}
 	s.writeAPIError(c, status, code, message)

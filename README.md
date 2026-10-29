@@ -188,7 +188,7 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN'
 {"otp":"876543","time":"2026-08-11T12:00:00+08:00"}
 ```
 
-除上述默认 JSON 契约外，还可以用 `format` 参数改变输出形态。查询串只接受 `token`、`format` 与 `message`；`message` 只能与 `format=html` 同时出现，且必须是正整数。多余参数、重复参数或无法解析的查询串一律按凭证无效拒绝：
+除上述默认 JSON 契约外，还可以用 `format` 参数改变输出形态。查询串只接受 `token`、`format`、`message` 与 `fetch`；`message` 与 `fetch` 都只能与 `format=html` 同时出现，`message` 必须是正整数，`fetch` 只能是 `1`。多余参数、重复参数或无法解析的查询串一律按凭证无效拒绝：
 
 ```bash
 # 只输出最新验证码本身（以单个换行结尾）
@@ -201,9 +201,9 @@ curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN&format=html'
 curl 'https://HOST/api/v1/otp?token=DERIVED_TOKEN&format=html&message=MESSAGE_ID'
 ```
 
-`format=plain` 的响应体就是验证码本身（例如 `876543`），Content-Type 为 `text/plain`。`format=html` 返回该隐私邮箱的归档邮件列表，最新优先、最多 100 封，包括没有提取到验证码的邮件；没有归档邮件时返回 `200` 与零字节响应体。
+`format=plain` 的响应体就是验证码本身（例如 `876543`），Content-Type 为 `text/plain`。`format=html` 返回该隐私邮箱的归档邮件列表，最新优先、最多 100 封，包括没有提取到验证码的邮件。页面上方固定显示隐私邮箱地址与「收取邮件」按钮；没有归档邮件时仍返回同一个页面，地址位显示「—」、列表为空。「收取邮件」是指向当前 URL 并附带 `fetch=1` 的普通链接，点击后整页重载并显示「已请求收取，请稍后再次点击查看」；它不新增任何同步逻辑，后台同步仍由每次有效请求触发。
 
-`/api/v1/otp` 对无效凭证按来源 IP 限流：同一 IP 每分钟最多 30 次无效请求，超出后 JSON 与 `format=plain` 返回 `429 RATE_LIMITED`，`format=html`（包括无效或被限流的请求）一律返回 `200` 与零字节响应体。有效凭证在验签成功后归还本次名额，因此正常轮询不会被限流；代价是同一 IP 的无效请求打满额度后，该 IP 上的有效请求也会在窗口结束前被拒绝。
+`/api/v1/otp` 对无效凭证按来源 IP 限流：同一 IP 每分钟最多 30 次无效请求，超出后 JSON 与 `format=plain` 返回 `429 RATE_LIMITED`，`format=html`（包括无效或被限流的请求）一律返回 `200` 与「有效但暂无邮件」完全相同的页面（地址位「—」、列表为空），提示行是否出现只取决于 `fetch=1`。有效凭证在验签成功后归还本次名额，因此正常轮询不会被限流；代价是同一 IP 的无效请求打满额度后，该 IP 上的有效请求也会在窗口结束前被拒绝。
 
 `format=html&message=<id>` 返回单封邮件的阅读页：用 token 打开时，顶部是发件人、主题、时间与「返回列表」，正文放在沙箱 iframe 中。发信人提供的 HTML 仍按原字节渲染，所以图片和按钮都能正常加载与点击；纯文本邮件则转义后以等宽块显示。`message` 必须属于当前 token 绑定的隐私邮箱，否则与正文已清理、校验失败一样返回 `404 MAIL_CONTENT_UNAVAILABLE`。正文以 `ICLOUD_API_MAX_BODY_BYTES`（默认 512 KiB）为上限，超出的部分会被截断。页面里的阅读链接会保留 URL 中的 token；用 Bearer 调用时链接不带凭据，请继续用携带 `Authorization` 的请求访问 `format=html&message=ID`。管理界面「复制取码格式」生成的链接始终不带 `format`，需要这些形态时请手动拼接参数。
 
